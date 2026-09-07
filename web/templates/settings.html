@@ -35,7 +35,7 @@
           <div class="text-xs text-slate-400">{{ t('capacity_desc') }}</div>
         </div>
         <div class="flex items-center gap-2">
-          <span class="text-white font-bold">{{ settings.get('battery_capacity_kwh', '67.1') }}</span>
+          <span class="text-white font-bold">{{ settings.get('battery_capacity_kwh', '53.9') }}</span>
           <span class="text-slate-400 text-sm">kWh</span>
         </div>
       </div>
@@ -127,7 +127,7 @@
             </div>
           </div>
           <div style="display:flex;align-items:center;gap:6px">
-            <span style="color:#64748b;font-size:13px">€</span>
+            <span style="color:#64748b;font-size:13px">$</span>
             <input type="number" name="{{ setting_key }}"
                    value="{{ settings.get(setting_key, '0.00') }}"
                    step="0.01" min="0" max="9.99"
