@@ -91,6 +91,8 @@ CANONICAL_SIGNALS: list[tuple[str, str]] = [
 EXTRA_SIGNALS: list[tuple[str, str]] = [
     ("sensor", "charging_status"),
     ("sensor", "model_year"),
+    ("sensor", "last_powered_on"),
+    ("sensor", "last_powered_off"),
     ("switch", "charging"),
     ("switch", "air_conditioning"),
     ("switch", "front_defrost"),

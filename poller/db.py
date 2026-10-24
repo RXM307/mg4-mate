@@ -693,17 +693,108 @@ class Database:
             (vehicle_id,),
         ).fetchone()
 
-    def create_ghost_trip(self, vehicle_id: int, dist_km: float, started_at: str, ended_at: str) -> int:
+    def create_ghost_trip(
+        self, vehicle_id: int, dist_km: float, started_at: str, ended_at: str,
+        *, start_odometer_km: Optional[float] = None, end_odometer_km: Optional[float] = None,
+        start_soc: Optional[float] = None, end_soc: Optional[float] = None,
+        times_known: bool = False,
+    ) -> int:
         """Create a trip record for driving that wasn't captured live (odometer jump while parked)."""
+        duration = None
+        try:
+            if times_known:
+                duration = round(
+                    (datetime.fromisoformat(ended_at) - datetime.fromisoformat(started_at)).total_seconds() / 60, 1
+                )
+        except (TypeError, ValueError):
+            pass
+        efficiency = self._ghost_efficiency(dist_km, start_soc, end_soc)
         cur = self._conn.execute(
-            """INSERT INTO trips (vehicle_id, started_at, ended_at, distance_km, untracked)
-               VALUES (?,?,?,?,1)""",
-            (vehicle_id, started_at, ended_at, round(dist_km, 3)),
+            """INSERT INTO trips (vehicle_id, started_at, ended_at, distance_km, untracked,
+                                  start_odometer_km, end_odometer_km, start_soc, end_soc,
+                                  duration_min, efficiency_kwh_100km)
+               VALUES (?,?,?,?,1,?,?,?,?,?,?)""",
+            (vehicle_id, started_at, ended_at, round(dist_km, 3),
+             start_odometer_km, end_odometer_km, start_soc, end_soc, duration, efficiency),
         )
         self._conn.commit()
         trip_id = cur.lastrowid
         log.info("Ghost trip #%d created — %.1f km (%s → %s)", trip_id, dist_km, started_at, ended_at)
         return trip_id
+
+    def _ghost_efficiency(self, dist_km, start_soc, end_soc) -> Optional[float]:
+        if not dist_km or dist_km <= 0.5 or start_soc is None or end_soc is None or end_soc >= start_soc:
+            return None
+        energy = (start_soc - end_soc) / 100.0 * self.get_battery_capacity()
+        return round(energy / dist_km * 100, 2)
+
+    def backfill_ghost_trips(self, vehicle_id: int) -> int:
+        """Fill odometer/SOC/efficiency on untracked trips from the recorded positions.
+
+        Ghost trips used to be stored with only a distance. The positions table still has the
+        odometer and SOC from just before and just after each jump, so reconstruct them.
+        Idempotent: only touches untracked trips that still have no start SOC.
+        """
+        trips = self._conn.execute(
+            """SELECT id, ended_at, distance_km FROM trips
+               WHERE vehicle_id=? AND untracked=1 AND start_soc IS NULL AND ended_at IS NOT NULL""",
+            (vehicle_id,),
+        ).fetchall()
+        fixed = 0
+        for t in trips:
+            end = self._conn.execute(
+                """SELECT id, odometer_km FROM positions
+                   WHERE vehicle_id=? AND odometer_km IS NOT NULL
+                     AND ABS(julianday(recorded_at) - julianday(?)) < 0.007
+                   ORDER BY ABS(julianday(recorded_at) - julianday(?)) LIMIT 1""",
+                (vehicle_id, t["ended_at"], t["ended_at"]),
+            ).fetchone()
+            if not end:
+                continue
+            prev = self._conn.execute(
+                """SELECT id, odometer_km, soc, latitude, longitude FROM positions
+                   WHERE vehicle_id=? AND id<=? AND odometer_km < ? ORDER BY id DESC LIMIT 1""",
+                (vehicle_id, end["id"], end["odometer_km"] - 0.4),
+            ).fetchone()
+            if not prev:
+                continue
+            if abs((end["odometer_km"] - prev["odometer_km"]) - (t["distance_km"] or 0)) > 0.6:
+                continue  # positions don't line up with this trip; leave it alone
+            first_new = self._conn.execute(
+                """SELECT soc, latitude, longitude FROM positions
+                   WHERE vehicle_id=? AND id>? ORDER BY id LIMIT 1""",
+                (vehicle_id, prev["id"]),
+            ).fetchone()
+            if not first_new or prev["soc"] is None or first_new["soc"] is None:
+                continue
+            self._conn.execute(
+                """UPDATE trips SET start_odometer_km=?, end_odometer_km=?, start_soc=?, end_soc=?,
+                       start_lat=?, start_lon=?, end_lat=?, end_lon=?, efficiency_kwh_100km=?
+                   WHERE id=?""",
+                (prev["odometer_km"], end["odometer_km"], prev["soc"], first_new["soc"],
+                 prev["latitude"], prev["longitude"], first_new["latitude"], first_new["longitude"],
+                 self._ghost_efficiency(t["distance_km"], prev["soc"], first_new["soc"]), t["id"]),
+            )
+            fixed += 1
+        self._conn.commit()
+        if fixed:
+            log.info("Backfilled odometer/SOC on %d untracked trips", fixed)
+        return fixed
+
+    def get_ghost_trips_without_duration(self, vehicle_id: int) -> list:
+        return self._conn.execute(
+            """SELECT id, started_at, ended_at FROM trips
+               WHERE vehicle_id=? AND untracked=1 AND duration_min IS NULL AND ended_at IS NOT NULL
+               ORDER BY id""",
+            (vehicle_id,),
+        ).fetchall()
+
+    def update_ghost_trip_times(self, trip_id: int, started_at: str, ended_at: str, duration_min: float) -> None:
+        self._conn.execute(
+            "UPDATE trips SET started_at=?, ended_at=?, duration_min=? WHERE id=?",
+            (started_at, ended_at, round(duration_min, 1), trip_id),
+        )
+        self._conn.commit()
 
     def get_last_position_recorded_at(self, vehicle_id: int) -> Optional[str]:
         """Return the second-to-last recorded_at for the given vehicle (used as ghost trip start time)."""

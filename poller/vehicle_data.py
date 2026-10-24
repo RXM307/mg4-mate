@@ -47,6 +47,8 @@ class VehicleData:
     tyre_fr_bar: float = 0.0
     tyre_rl_bar: float = 0.0
     tyre_rr_bar: float = 0.0
+    last_powered_on: str | None = None    # ISO timestamps reported by the car/integration
+    last_powered_off: str | None = None
 
     def fingerprint(self) -> tuple:
         """Compact snapshot of signals that indicate car activity."""

@@ -25,6 +25,7 @@ class Recorder:
         self._started: bool = False
         self._last_process_ts: float = 0.0
         self._last_odo: Optional[float] = None
+        self._last_soc: Optional[float] = None
 
     @property
     def state(self) -> State:
@@ -106,14 +107,19 @@ class Recorder:
             if self._last_odo is not None and data.odometer_km - self._last_odo >= 0.5:
                 delta = data.odometer_km - self._last_odo
                 prev_recorded_at = self._db.get_last_position_recorded_at(self._vehicle_id)
-                started_at = prev_recorded_at or _now_iso()
-                self._db.create_ghost_trip(self._vehicle_id, delta, started_at, _now_iso())
+                started_at, ended_at, times_known = self._ghost_window(data, prev_recorded_at)
+                self._db.create_ghost_trip(
+                    self._vehicle_id, delta, started_at, ended_at,
+                    start_odometer_km=self._last_odo, end_odometer_km=data.odometer_km,
+                    start_soc=self._last_soc, end_soc=data.soc, times_known=times_known,
+                )
                 log.warning(
                     "Ghost trip detected: %.1f km (odometer %.1f → %.1f)",
                     delta, self._last_odo, data.odometer_km,
                 )
         if data.odometer_km:
             self._last_odo = data.odometer_km
+        self._last_soc = data.soc
 
         events = self._sm.update(data)
         for event in events:
@@ -134,6 +140,33 @@ class Recorder:
             if data.charge_power_kw > self._max_charge_kw:
                 self._max_charge_kw = data.charge_power_kw
                 self._db.update_charge_max_power(self._active_charge_id, self._max_charge_kw)
+
+    @staticmethod
+    def _ghost_window(data: VehicleData, prev_recorded_at: Optional[str]) -> tuple[str, str, bool]:
+        """Start/end for an untracked trip.
+
+        Prefer the car's own power-on/off timestamps (exact); otherwise fall back to
+        the previous position and now, which only brackets the trip.
+        """
+        def parse(value: Optional[str]) -> Optional[datetime]:
+            if not value:
+                return None
+            try:
+                dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+        on, off = parse(data.last_powered_on), parse(data.last_powered_off)
+        now = datetime.now(timezone.utc)
+        if (
+            on and off and on < off
+            and (off - on).total_seconds() <= 12 * 3600
+            and (now - off).total_seconds() <= 48 * 3600
+            and (off - now).total_seconds() <= 300
+        ):
+            return on.isoformat(), off.isoformat(), True
+        return prev_recorded_at or _now_iso(), _now_iso(), False
 
     def mark_offline(self) -> None:
         events = self._sm.mark_offline()

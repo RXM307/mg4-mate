@@ -66,9 +66,12 @@ class HomeAssistantHistoryClient:
         return em.wanted_entity_ids(self._entity_prefix, signals)
 
     def fetch_history(self, days: int) -> list[list[dict[str, Any]]]:
+        return self.fetch_entities(self.entity_ids(), days)
+
+    def fetch_entities(self, entity_ids: list[str], days: int) -> list[list[dict[str, Any]]]:
         start = datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 30)))
         query = urllib.parse.urlencode({
-            "filter_entity_id": ",".join(self.entity_ids()),
+            "filter_entity_id": ",".join(entity_ids),
             "minimal_response": "false",
         })
         req = urllib.request.Request(
@@ -114,6 +117,61 @@ def history_to_snapshots(history: list[list[dict[str, Any]]], entity_prefix: str
         seen.add(recorded_at)
         snapshots.append(HistoricalSnapshot(recorded_at=recorded_at, data=data))
     return snapshots
+
+
+def backfill_ghost_trip_times(db, vehicle_id: int, client: "HomeAssistantHistoryClient", days: int = 30) -> int:
+    """Give untracked trips their real start/end using the car's power-on/off sensors.
+
+    Home Assistant keeps the history of ``last_powered_on`` / ``last_powered_off``; the
+    value current when an untracked trip was detected is that trip's real start and end.
+    Only trips still inside Home Assistant's history retention can be fixed. Idempotent.
+    """
+    trips = db.get_ghost_trips_without_duration(vehicle_id)
+    if not trips:
+        return 0
+    prefix = client._entity_prefix
+    on_id = f"sensor.{prefix}_last_powered_on"
+    off_id = f"sensor.{prefix}_last_powered_off"
+    series: dict[str, list[tuple[datetime, datetime]]] = {on_id: [], off_id: []}
+    for group in client.fetch_entities([on_id, off_id], days):
+        for item in group:
+            if not isinstance(item, dict) or item.get("entity_id") not in series:
+                continue
+            ts = item.get("last_changed") or item.get("last_updated")
+            try:
+                value = _dt(str(item.get("state")))
+            except ValueError:
+                continue
+            if ts:
+                series[item["entity_id"]].append((_dt(ts), value))
+    for rows in series.values():
+        rows.sort(key=lambda r: r[0])
+
+    def value_at(entity_id: str, when: datetime) -> datetime | None:
+        current = None
+        for changed, value in series[entity_id]:
+            if changed > when:
+                break
+            current = value
+        return current
+
+    fixed = 0
+    for trip in trips:
+        try:
+            ended = _dt(trip["ended_at"])
+        except (TypeError, ValueError):
+            continue
+        ref = ended + timedelta(seconds=90)
+        on, off = value_at(on_id, ref), value_at(off_id, ref)
+        if not on or not off or on >= off:
+            continue
+        if (off - on).total_seconds() > 12 * 3600 or abs((off - ended).total_seconds()) > 3 * 3600:
+            continue
+        db.update_ghost_trip_times(
+            trip["id"], on.isoformat(), off.isoformat(), (off - on).total_seconds() / 60
+        )
+        fixed += 1
+    return fixed
 
 
 class HistoryImporter:

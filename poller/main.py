@@ -78,6 +78,20 @@ def main():
 
     db.mark_setup_complete()
 
+    # Repair untracked trips recorded by older versions (no SOC/odometer, 0 min).
+    try:
+        db.backfill_ghost_trips(vehicle_id)
+        if cfg["ha_url"] and cfg["token"]:
+            from ha_history import HomeAssistantHistoryClient, backfill_ghost_trip_times
+            n = backfill_ghost_trip_times(
+                db, vehicle_id,
+                HomeAssistantHistoryClient(cfg["ha_url"], cfg["token"], cfg["entity_prefix"]),
+            )
+            if n:
+                log.info("Set real start/end on %d untracked trips from HA history", n)
+    except Exception as exc:  # never block polling on a repair step
+        log.warning("Untracked-trip repair skipped: %s", exc)
+
     # Crash/restart recovery for open trips/charges happens on the first poll inside
     # Recorder._resume_or_close(), which RESUMES a still-ongoing session (avoiding
     # fragmentation) and only closes it if the activity has actually ended.

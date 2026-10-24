@@ -148,6 +148,8 @@ class HomeAssistantMateClient:
             tyre_fr_bar=em.pressure_bar(states, p, "sensor", "tyres_front_right_pressure") or 0.0,
             tyre_rl_bar=em.pressure_bar(states, p, "sensor", "tyres_rear_left_pressure") or 0.0,
             tyre_rr_bar=em.pressure_bar(states, p, "sensor", "tyres_rear_right_pressure") or 0.0,
+            last_powered_on=self._usable(states, "last_powered_on"),
+            last_powered_off=self._usable(states, "last_powered_off"),
         )
 
     def close(self):
@@ -260,6 +262,10 @@ class HomeAssistantMateClient:
 
     def _bool(self, states: dict[str, dict[str, Any]], domain: str, suffix: str) -> bool:
         return em.truthy(self._raw_state(states, domain, suffix))
+
+    def _usable(self, states: dict[str, dict[str, Any]], suffix: str) -> str | None:
+        value = self._raw_state(states, "sensor", suffix)
+        return None if value in em.UNUSABLE else str(value)
 
     def _locked(self, states: dict[str, dict[str, Any]]) -> bool:
         return str(self._raw_state(states, "lock", "doors_lock")).lower() == "locked"
