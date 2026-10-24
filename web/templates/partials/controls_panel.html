@@ -67,9 +67,9 @@
 
 <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
   <section class="card">
-    <h2 class="font-semibold text-white mb-4">Sicurezza</h2>
+    <h2 class="font-semibold text-white mb-4">Security</h2>
     <div class="space-y-3">
-      {% for key, label in [('doors', 'Porte'), ('boot', 'Bagagliaio'), ('cable', 'Cavo ricarica')] %}
+      {% for key, label in [('doors', 'Doors'), ('boot', 'Boot'), ('cable', 'Charging cable')] %}
         {% set item = locks.get(key) %}
         {% if item %}
         <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 bg-slate-900 rounded-lg p-3">
@@ -78,8 +78,8 @@
             <div class="text-xs text-slate-400">{{ item.state }}</div>
           </div>
           <div class="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:justify-end">
-            {{ action_button('Blocca', 'lock', item.entity_id) }}
-            {{ action_button('Sblocca', 'unlock', item.entity_id, tone='danger') }}
+            {{ action_button('Lock', 'lock', item.entity_id) }}
+            {{ action_button('Unlock', 'unlock', item.entity_id, tone='danger') }}
           </div>
         </div>
         {% endif %}
@@ -88,12 +88,12 @@
   </section>
 
   <section class="card">
-    <h2 class="font-semibold text-white mb-4">Clima</h2>
+    <h2 class="font-semibold text-white mb-4">Climate</h2>
     {% if climate %}
     <div class="bg-slate-900 rounded-lg p-3 mb-3">
       <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
         <div>
-          <div class="text-white text-sm font-semibold">Clima abitacolo</div>
+          <div class="text-white text-sm font-semibold">Cabin climate</div>
           <div class="text-xs text-slate-400">{{ climate.state }} · target {{ climate.temperature|int }}°C</div>
         </div>
         <div class="grid grid-cols-2 gap-2 sm:flex">
@@ -111,18 +111,20 @@
     </div>
     {% endif %}
     <div class="space-y-3">
-      {{ switch_row(switches.get('fan_only'), 'Solo ventola') }}
-      {{ switch_row(switches.get('front_defroster'), 'Sbrina frontale') }}
-      {{ switch_row(switches.get('rear_defroster'), 'Sbrina posteriore') }}
+      {{ switch_row(switches.get('air_conditioning'), 'Air conditioning') }}
+      {{ switch_row(switches.get('fan_only'), 'Fan only') }}
+      {{ switch_row(switches.get('front_defroster'), 'Front defrost') }}
+      {{ switch_row(switches.get('rear_defroster'), 'Rear defrost') }}
     </div>
   </section>
 </div>
 
 <div class="grid grid-cols-1 lg:grid-cols-2 gap-5 mt-5">
   <section class="card">
-    <h2 class="font-semibold text-white mb-4">Ricarica e batteria</h2>
+    <h2 class="font-semibold text-white mb-4">Charging & battery</h2>
     <div class="space-y-3">
-      {{ switch_row(switches.get('charging'), 'Ricarica') }}
+      {{ switch_row(switches.get('charging'), 'Charging') }}
+      {{ switch_row(controls.get('cable_lock_switch'), 'Charge port lock') }}
       {{ switch_row(switches.get('battery_heating'), 'Battery heating') }}
       {% set target = numbers.get('target_soc') %}
       {% if target %}
@@ -137,14 +139,14 @@
                value="{{ target.value|int }}"
                oninput="document.getElementById('target-soc-val').textContent=this.value"
                class="w-full accent-brand mt-3">
-        <button class="mt-3 px-3 py-2 rounded-lg bg-brand text-white text-sm font-semibold">Imposta</button>
+        <button class="mt-3 px-3 py-2 rounded-lg bg-brand text-white text-sm font-semibold">Set</button>
       </form>
       {% endif %}
       {% set limit = selects.get('charge_current_limit') %}
       {% if limit %}
       <div class="bg-slate-900 rounded-lg p-3">
         <div class="flex justify-between items-center mb-2">
-          <div class="text-white text-sm font-semibold">Limite corrente</div>
+          <div class="text-white text-sm font-semibold">Current limit</div>
           <div class="text-xs text-slate-400">{{ limit.state }}</div>
         </div>
         <div class="grid grid-cols-2 sm:flex sm:flex-wrap gap-2">
@@ -158,8 +160,8 @@
   </section>
 
   <section class="card">
-    <h2 class="font-semibold text-white mb-4">Comfort e utility</h2>
-    {% for key, label in [('heated_seat_left', 'Sedile guidatore'), ('heated_seat_right', 'Sedile passeggero')] %}
+    <h2 class="font-semibold text-white mb-4">Comfort & utilities</h2>
+    {% for key, label in [('heated_seat_left', 'Front left seat'), ('heated_seat_right', 'Front right seat')] %}
       {% set seat = selects.get(key) %}
       {% if seat %}
       <div class="bg-slate-900 rounded-lg p-3 mb-3">

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.5.1
+
+- Added support for Home Assistant integrations that name entities after the device instead of the VIN (e.g. MG4 EV Urban: `sensor.mg_mg4_ev_urban_state_of_charge`). New `poller/entity_map.py` maps the SAIC-gateway names to these alternatives; the original names are tried first, so existing setups are unaffected.
+- Charging and plugged-in state are derived from `charging_status`, `charging_gun_state` and the charging switch when no `battery_charging` / `charger_connected` sensor exists.
+- Tyre pressure, power and remaining charge time honour the entity's unit of measurement.
+- The poller now discovers which candidate entities exist and polls only those; the startup log reports how many signals have data and lists the rest.
+- Remote controls (lock, climate, defrost, charging, port lock, target temperature) work with the device-name entities.
+
 ## 1.5.0
 
 - Added maintenance tracker: MG4-specific 10-item service schedule (tires, brake fluid, cabin filter, A/C, HV battery, full inspection, etc.) with overdue/upcoming/OK status, inline "Log service" form, and full service history log.

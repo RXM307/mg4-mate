@@ -187,17 +187,32 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
     ]),
 ]
 
+# Earlier versions seeded these default items with Italian titles; untouched ones
+# are renamed on startup.
+_LEGACY_ITALIAN_TITLES = {
+    "Rotazione pneumatici": "Tyre rotation",
+    "Filtro abitacolo": "Cabin air filter",
+    "Liquido freni": "Brake fluid",
+    "Controllo pastiglie freno": "Brake pad inspection",
+    "Tergicristalli": "Wiper blades",
+    "Revisione impianto A/C": "A/C system service",
+    "Ispezione liquido raffreddamento": "Coolant inspection",
+    "Fluido ponte motore": "Drive unit fluid",
+    "Controllo batteria HV": "HV battery check",
+    "Tagliando completo": "Full service",
+}
+
 _MG4_SCHEDULE: list[tuple[str, int | None, int | None, str]] = [
-    ("Rotazione pneumatici",                10_000, 12, "either"),
-    ("Filtro abitacolo",                    20_000, 24, "either"),
-    ("Liquido freni",                         None, 24, "months"),
-    ("Controllo pastiglie freno",           20_000, 24, "either"),
-    ("Tergicristalli",                        None, 12, "months"),
-    ("Revisione impianto A/C",                None, 24, "months"),
-    ("Ispezione liquido raffreddamento",    60_000, 60, "either"),
-    ("Fluido ponte motore",                 40_000, 48, "either"),
-    ("Controllo batteria HV",                 None, 12, "months"),
-    ("Tagliando completo",                  30_000, 24, "either"),
+    ("Tyre rotation",                10_000, 12, "either"),
+    ("Cabin air filter",                    20_000, 24, "either"),
+    ("Brake fluid",                         None, 24, "months"),
+    ("Brake pad inspection",           20_000, 24, "either"),
+    ("Wiper blades",                        None, 12, "months"),
+    ("A/C system service",                None, 24, "months"),
+    ("Coolant inspection",    60_000, 60, "either"),
+    ("Drive unit fluid",                 40_000, 48, "either"),
+    ("HV battery check",                 None, 12, "months"),
+    ("Full service",                  30_000, 24, "either"),
 ]
 
 
@@ -255,6 +270,11 @@ class Database:
         self._conn.commit()
 
     def _seed_maintenance_items(self) -> None:
+        for old, new in _LEGACY_ITALIAN_TITLES.items():
+            self._conn.execute(
+                "UPDATE maintenance_items SET title = ? WHERE title = ?", (new, old)
+            )
+        self._conn.commit()
         count = self._conn.execute(
             "SELECT COUNT(*) FROM maintenance_items"
         ).fetchone()[0]

@@ -1,16 +1,16 @@
 # saic_gateway_set_inactive_period.yaml
 #
-# PROBLEMA RISOLTO
-# Il SAIC MQTT Gateway ha per default gateway_inactive_refresh_period = 86400s
-# (24 ore). Quando la macchina è ferma, il gateway interroga SAIC una volta al
-# giorno: se l'auto parte prima del prossimo ciclo, MG4 Mate non riceve mai
-# vehicle_running = on e il viaggio non viene registrato.
+# PROBLEM SOLVED
+# The SAIC MQTT Gateway defaults to gateway_inactive_refresh_period = 86400s
+# (24 hours). While the car is parked, the gateway queries SAIC once a day:
+# if the car sets off before the next cycle, MG4 Mate never sees
+# vehicle_running = on and the trip is not recorded.
 #
-# SOLUZIONE
-# Abbassa il periodo a 3600s (1h, minimo consentito dal gateway) una volta sola.
-# Il polling è verso la SAIC cloud API (non sveglia fisicamente la macchina).
+# SOLUTION
+# Lower the period to 3600s (1h, the gateway minimum) once.
+# Polling goes to the SAIC cloud API (it does not physically wake the car).
 #
-# COME APPLICARE (una tantum, da HA Strumenti sviluppatori → Servizi):
+# HOW TO APPLY (one-off, from HA Developer Tools → Services):
 #
 #   service: number.set_value
 #   target:
@@ -18,15 +18,15 @@
 #   data:
 #     value: 3600
 #
-# Oppure usa lo script completo qui sotto per avere un log nel logbook HA.
+# Or use the full script below to get an entry in the HA logbook.
 
-alias: "MG4 - Imposta gateway inactive refresh 3600s"
+alias: "MG4 - Set gateway inactive refresh to 3600s"
 description: >
-  Abbassa gateway_inactive_refresh_period a 3600s (minimo gateway, default: 86400s).
-  Eseguire una sola volta — il valore persiste nel gateway SAIC.
+  Lowers gateway_inactive_refresh_period to 3600s (gateway minimum, default: 86400s).
+  Run once — the value persists in the SAIC gateway.
 mode: single
 
-trigger: []   # nessun trigger: esegui manualmente da Strumenti sviluppatori
+trigger: []   # no trigger: run manually from Developer Tools
 
 action:
   - service: number.set_value

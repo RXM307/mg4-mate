@@ -9,6 +9,19 @@ from typing import Any
 StateFetcher = Callable[[], list[dict[str, Any]]]
 ServiceCaller = Callable[[str, str, dict[str, Any]], Any]
 
+# Canonical (SAIC MQTT gateway) control entity -> alternatives used by other
+# integrations (e.g. device-name entities such as lock.mg_mg4_ev_urban_lock).
+# Kept in sync with poller/entity_map.py; duplicated because web and poller run
+# with separate import paths.
+ALIASES: dict[tuple[str, str], list[tuple[str, str]]] = {
+    ("lock", "doors_lock"): [("lock", "lock")],
+    ("climate", "vehicle_climate"): [("climate", "climate")],
+    ("switch", "front_window_defroster_heating"): [("switch", "front_defrost")],
+    ("switch", "rear_window_defroster_heating"): [("switch", "rear_window_defrost")],
+    ("switch", "charging_cable_lock"): [("switch", "charging_port_lock")],
+}
+UNUSABLE = {"unavailable", "unknown", "", None}
+
 
 class HomeAssistantCommandClient:
     def __init__(
@@ -35,6 +48,7 @@ class HomeAssistantCommandClient:
                 "boot": self._entity_descriptor(states, "lock", "boot_lock"),
                 "cable": self._entity_descriptor(states, "lock", "charging_cable_lock"),
             },
+            "cable_lock_switch": self._entity_descriptor(states, "switch", "charging_cable_lock"),
             "climate": self._climate_descriptor(states),
             "switches": {
                 "front_defroster": self._entity_descriptor(states, "switch", "front_window_defroster_heating"),
@@ -43,6 +57,7 @@ class HomeAssistantCommandClient:
                 "battery_heating": self._entity_descriptor(states, "switch", "battery_heating"),
                 "charging": self._entity_descriptor(states, "switch", "charging"),
                 "find_my_car": self._entity_descriptor(states, "switch", "find_my_car"),
+                "air_conditioning": self._entity_descriptor(states, "switch", "air_conditioning"),
             },
             "numbers": {
                 "target_soc": self._number_descriptor(states, "target_soc"),
@@ -73,6 +88,11 @@ class HomeAssistantCommandClient:
         return self._call_service("climate", "turn_off", {"entity_id": entity_id})
 
     def set_climate_temperature(self, entity_id: str, temperature: float) -> Any:
+        # Some integrations expose the target temperature as a number entity and
+        # a climate entity that cannot set it; use the number when it exists.
+        number_id = self._entity("number", "climate_target_temperature")
+        if number_id in self._state_map(self._fetch_states()):
+            return self.set_number(number_id, temperature)
         return self._call_service(
             "climate",
             "set_temperature",
@@ -107,11 +127,25 @@ class HomeAssistantCommandClient:
             and s["entity_id"].split(".", 1)[-1].startswith(self._entity_prefix)
         }
 
+    def _find(self, states: dict[str, dict[str, Any]], domain: str, suffix: str) -> tuple[str, dict[str, Any]] | None:
+        """First candidate with a usable state, else the first that exists at all."""
+        first = None
+        for d, s in [(domain, suffix), *ALIASES.get((domain, suffix), [])]:
+            entity_id = self._entity(d, s)
+            item = states.get(entity_id)
+            if not item:
+                continue
+            if first is None:
+                first = (entity_id, item)
+            if item.get("state") not in UNUSABLE:
+                return entity_id, item
+        return first
+
     def _entity_descriptor(self, states: dict[str, dict[str, Any]], domain: str, suffix: str) -> dict[str, Any] | None:
-        entity_id = self._entity(domain, suffix)
-        item = states.get(entity_id)
-        if not item:
+        found = self._find(states, domain, suffix)
+        if not found:
             return None
+        entity_id, item = found
         return {
             "entity_id": entity_id,
             "state": item.get("state", "unknown"),
@@ -146,8 +180,12 @@ class HomeAssistantCommandClient:
         if not base:
             return None
         attrs = states[base["entity_id"]].get("attributes") or {}
+        temperature = self._float(attrs.get("temperature"))
+        if temperature is None:
+            number = states.get(self._entity("number", "climate_target_temperature")) or {}
+            temperature = self._float(number.get("state"), 21)
         base.update({
-            "temperature": self._float(attrs.get("temperature"), 21),
+            "temperature": temperature,
             "current_temperature": self._float(attrs.get("current_temperature")),
             "min_temp": self._float(attrs.get("min_temp"), 17),
             "max_temp": self._float(attrs.get("max_temp"), 31),

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import entity_map as em
 from db import haversine_km
 from vehicle_data import VehicleData
 
@@ -39,6 +40,10 @@ HISTORY_SUFFIXES = {
     "device_tracker": ["vehicle_position"],
 }
 
+# Extra signals used to derive charging state on integrations without
+# battery_charging / charger_connected sensors
+HISTORY_EXTRAS = [("sensor", "charging_status"), ("switch", "charging")]
+
 
 @dataclass
 class HistoricalSnapshot:
@@ -53,11 +58,12 @@ class HomeAssistantHistoryClient:
         self._entity_prefix = entity_prefix.lower()
 
     def entity_ids(self) -> list[str]:
-        return [
-            f"{domain}.{self._entity_prefix}_{suffix}"
+        signals = [
+            (domain, suffix)
             for domain, suffixes in HISTORY_SUFFIXES.items()
             for suffix in suffixes
-        ]
+        ] + HISTORY_EXTRAS
+        return em.wanted_entity_ids(self._entity_prefix, signals)
 
     def fetch_history(self, days: int) -> list[list[dict[str, Any]]]:
         start = datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 30)))
@@ -225,13 +231,13 @@ def _vehicle_data(states: dict[str, dict[str, Any]], prefix: str, ts: str) -> Ve
     if soc is None or odometer is None:
         return None
 
-    charging = _bool(_state(states, "binary_sensor", prefix, "battery_charging"))
-    plugged = _bool(_state(states, "binary_sensor", prefix, "charger_connected"))
+    charging = em.is_charging(states, prefix)
+    plugged = em.is_plugged(states, prefix)
     running = _bool(_state(states, "binary_sensor", prefix, "vehicle_running"))
-    power = abs(_float(_state(states, "sensor", prefix, "power"), 0.0) or 0.0)
+    power = abs(em.charge_power_kw(states, prefix))
     current = _float(_state(states, "sensor", prefix, "current"), 0.0) or 0.0
     voltage = _float(_state(states, "sensor", prefix, "voltage"), 0.0) or 0.0
-    tracker = states.get(f"device_tracker.{prefix}_vehicle_position") or {}
+    tracker = em.resolve(states, prefix, "device_tracker", "vehicle_position") or {}
     attrs = tracker.get("attributes") or {}
     vehicle_state = "driving" if running or speed > 1 else "parked"
     windows = any(_bool(_state(states, "binary_sensor", prefix, suffix)) for suffix in (
@@ -265,14 +271,14 @@ def _vehicle_data(states: dict[str, dict[str, Any]], prefix: str, ts: str) -> Ve
         sunshade_open=False,
         any_door_open=False,
         plug_connected=plugged,
-        remaining_charge_min=int((_float(_state(states, "sensor", prefix, "remaining_charging_time"), 0.0) or 0.0) / 60),
+        remaining_charge_min=em.duration_minutes(states, prefix),
         charge_voltage_v=voltage,
         charge_current_a=current,
     )
 
 
 def _state(states: dict[str, dict[str, Any]], domain: str, prefix: str, suffix: str) -> Any:
-    return (states.get(f"{domain}.{prefix}_{suffix}") or {}).get("state")
+    return em.state_of(states, prefix, domain, suffix)
 
 
 def _bool(value: Any) -> bool:

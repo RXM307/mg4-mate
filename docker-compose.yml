@@ -1,5 +1,6 @@
 services:
   mg4-mate:
+    env_file: .env
     build:
       context: .
       dockerfile: Dockerfile
@@ -9,11 +10,4 @@ services:
       - "4000:4000"
     volumes:
       - ./data:/data            # persistent DB only (code is baked into the image)
-    environment:
-      - DB_PATH=/data/mg4_mate.db
-      # Optional MG4/Home Assistant source:
-      # - VEHICLE_SOURCE=homeassistant
-      # - HA_URL=https://your-home-assistant.example
-      # - HA_TOKEN=your-long-lived-access-token
-      # - HA_ENTITY_PREFIX=lsjwh4097rn111393
     restart: unless-stopped

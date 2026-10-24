@@ -70,3 +70,11 @@ lock.<prefix>_doors_lock
 - The SQLite recorder, trips, charges, statistics, and web UI are reused.
 - Trip quality depends on the SAIC gateway refresh cadence. Around 30-40 second updates are enough for useful maps and statistics.
 - Do not commit Home Assistant tokens. Pass them only through add-on options or environment variables.
+
+
+## Device-name entities (e.g. MG4 EV Urban)
+
+If your entities look like `sensor.mg_mg4_ev_urban_state_of_charge` rather than `sensor.<vin>_soc`, set
+`HA_ENTITY_PREFIX` to the part before the signal name (`mg_mg4_ev_urban`). MG4 Mate tries the SAIC-gateway name
+first and then the alternatives listed in `poller/entity_map.py` (and `web/ha_commands.py` for controls).
+On startup the poller log shows how many signals have data and which have none.
