@@ -8,6 +8,7 @@ from typing import Optional
 
 from db import Database, _now_iso
 from state_machine import State, StateMachine, StateEvent, _PARKED_STATES
+from regen import RegenTracker, record_votes, regen_is_negative
 from vehicle_data import VehicleData
 
 log = logging.getLogger(__name__)
@@ -20,7 +21,8 @@ class Recorder:
         self._sm = StateMachine()
         self._active_trip_id: Optional[int] = None
         self._active_charge_id: Optional[int] = None
-        self._regen_kwh: float = 0.0
+        self._regen_kwh: float = 0.0          # legacy accumulation / base of a merged trip
+        self._regen = RegenTracker()          # signed battery power integrated while driving
         self._max_charge_kw: float = 0.0
         self._started: bool = False
         self._last_process_ts: float = 0.0
@@ -132,8 +134,12 @@ class Recorder:
         # discharge for regen.
         if self._sm.state == State.DRIVING and self._active_trip_id:
             self._db.add_trip_position(self._active_trip_id, data)
-            if not data.plug_connected and data.charge_current_a < -3.0:
-                self._regen_kwh += data.charge_power_kw * (dt / 3600)
+            if not data.plug_connected:
+                power = getattr(data, "battery_power_kw", None)
+                if isinstance(power, (int, float)) and not isinstance(power, bool):
+                    self._regen.add(power, dt)        # integrations that report signed pack power
+                elif data.charge_current_a < -3.0:
+                    self._regen_kwh += data.charge_power_kw * (dt / 3600)   # SAIC gateway
 
         # During active charge: track peak power (persisted so it survives a restart)
         if self._sm.state == State.CHARGING and self._active_charge_id:
@@ -178,11 +184,22 @@ class Recorder:
         for e in events:
             self._handle_event(e, None)
 
+    def _final_regen(self) -> float:
+        """Regen for the trip being closed; resolves the sign convention and resets the tracker."""
+        total = self._regen_kwh
+        tracker = self._regen
+        if tracker.has_data:
+            total += tracker.regen_kwh(regen_is_negative(self._db, tracker.pos_kwh, tracker.neg_kwh))
+            record_votes(self._db, tracker.pos_kwh, tracker.neg_kwh)
+        self._regen = RegenTracker()
+        return total
+
     def _handle_event(self, event: StateEvent, data: Optional[VehicleData]) -> None:
         frm, to = event.from_state, event.to_state
 
         if to == State.DRIVING:
             self._regen_kwh = 0.0
+            self._regen = RegenTracker()
             gap_min = int(self._db.get_setting_value('trip_merge_gap_min', '5'))
             recent = self._db.get_recent_ended_trip(self._vehicle_id, gap_min * 60) if gap_min > 0 else None
             if recent:
@@ -195,16 +212,18 @@ class Recorder:
 
         elif frm == State.DRIVING and to in _PARKED_STATES:
             if self._active_trip_id and data:
-                self._db.finalize_trip(self._active_trip_id, data, self._regen_kwh)
+                self._db.finalize_trip(self._active_trip_id, data, self._final_regen())
             self._active_trip_id = None
             self._regen_kwh = 0.0
+            self._regen = RegenTracker()
 
         elif to == State.CHARGING:
             if self._active_trip_id and data:
                 # Plug inserted while driving → trip closed immediately, no 20s wait
-                self._db.finalize_trip(self._active_trip_id, data, self._regen_kwh)
+                self._db.finalize_trip(self._active_trip_id, data, self._final_regen())
                 self._active_trip_id = None
                 self._regen_kwh = 0.0
+                self._regen = RegenTracker()
             self._max_charge_kw = 0.0
             if data:
                 self._active_charge_id = self._db.create_charge(self._vehicle_id, data)

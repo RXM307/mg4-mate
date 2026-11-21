@@ -91,6 +91,7 @@ CANONICAL_SIGNALS: list[tuple[str, str]] = [
 EXTRA_SIGNALS: list[tuple[str, str]] = [
     ("sensor", "charging_status"),
     ("sensor", "model_year"),
+    ("sensor", "instant_power"),
     ("sensor", "last_powered_on"),
     ("sensor", "last_powered_off"),
     ("switch", "charging"),
@@ -237,3 +238,18 @@ def is_charging(states: dict[str, dict[str, Any]], prefix: str) -> bool:
     if truthy(state_of(states, prefix, "switch", "charging")):
         return True
     return is_plugged(states, prefix) and abs(charge_power_kw(states, prefix)) > 0.05
+
+
+def battery_power_kw(states: dict[str, dict[str, Any]], prefix: str) -> float | None:
+    """Signed battery power in kW from ``instant_power``, or None when the car has no such sensor.
+
+    Deliberately separate from charge_power_kw(): the charging_* sensors are charger-side
+    values that stay at 0 while driving, so they can't show regeneration.
+    """
+    item = states.get(entity_id(prefix, "sensor", "instant_power"))
+    value = to_float((item or {}).get("state"))
+    if value is None:
+        return None
+    if _unit(item) == "w":
+        value /= 1000.0
+    return value

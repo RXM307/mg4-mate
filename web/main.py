@@ -359,7 +359,7 @@ async def save_prices(request: Request):
 async def history_import(request: Request):
     form = await request.form()
     try:
-        days = max(1, min(int(form.get("days", 7)), 30))
+        days = max(1, min(int(form.get("days", 7)), 365))
     except (TypeError, ValueError):
         days = 7
 
@@ -383,16 +383,31 @@ async def history_import(request: Request):
         token = db_reader.get_setting("ha_token") or os.environ.get("HA_TOKEN") or _addon_option("HA_TOKEN")
         vehicle_id = db.ensure_vehicle(prefix.upper(), "MG4")
         client = HomeAssistantHistoryClient(ha_url, token, prefix)
-        result = HistoryImporter(db, vehicle_id, prefix).import_days(client, days)
+        result = HistoryImporter(db, vehicle_id, prefix).repair_days(client, days)
         db.close()
         return HTMLResponse(
             "<span style='color:#22c55e;font-size:13px'>"
-            f"✓ Imported {result['positions']} positions, {result['trips']} trips, {result['charges']} charges"
-            "</span>"
+            f"✓ Repaired {result['positions_fixed']} positions and {result['trips_filled']} untracked trips "
+            f"(real times for {result['trip_times']}); added {result['positions_added']} positions, "
+            f"{result['trips']} trips, {result['charges']} charges"
+            + (f" · untracked trips not repaired: {sk}" if (sk := {k: v for k, v in (result.get('trips_skipped') or {}).items() if k != 'candidates' and v}) else "")
+            + (lambda bp: f" · positions with no SOC: {bp['total']} total, {bp['in_window']} in the last {result['window_days']}d (oldest {bp['oldest']})" if bp and bp.get("total") else "")(result.get("bad_positions"))
+            + (f" · ⚠ stages that failed: {'; '.join(f'{k}: {v}' for k, v in result['stage_errors'].items())}" if result.get("stage_errors") else "")
+            + (f" · regen added to {result['trips_regen']} trips" if result.get("trips_regen") else "")
+            + (f" · estimated from long-term statistics: {result['stats_trips']} trips, {result['stats_positions']} positions" if result.get("stats_trips") or result.get("stats_positions") else "")
+            + (f" · long-term statistics unavailable: {result['stats_error']}" if result.get("stats_error") else "")
+            + (" · no long-term statistics found for the SOC sensor" if result.get("stats_found") is False else "")
+            + (f" · Home Assistant only has data from {result['history_from']}" if result.get("history_from") else "")
+            + ("" if result.get("snapshots") else " · ⚠ Home Assistant returned no usable history; check the entity prefix and recorder")
+            + "</span>"
         )
     except Exception as exc:
+        import html as _html
+        import logging as _logging
+        _logging.getLogger("mg4_mate_web").exception("History import failed")
         return HTMLResponse(
-            f"<span style='color:#ef4444;font-size:13px'>Import failed: {exc}</span>",
+            f"<span style='color:#ef4444;font-size:13px'>Import failed: {_html.escape(type(exc).__name__)}: "
+            f"{_html.escape(str(exc))} — see the container log for the full traceback</span>",
             status_code=500,
         )
 

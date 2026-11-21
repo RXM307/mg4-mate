@@ -155,7 +155,9 @@
   <div class="card">
     <h2 class="font-semibold text-white mb-1">Home Assistant history</h2>
     <p class="text-xs text-slate-400 mb-4">
-      Import existing MG4 history from Home Assistant so trips, charges and statistics do not start from zero.
+      Repair and import MG4 history from Home Assistant: fixes missing SOC/odometer on past data, fills in
+      untracked trips with real times, and adds charges and trips that were never recorded. Only goes back as far
+      as Home Assistant keeps history (10 days by default; pick a longer period to reach further back).
     </p>
 
     <form hx-post="api/history-import"
@@ -163,7 +165,7 @@
           hx-swap="innerHTML"
           class="space-y-4">
       <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
-        {% for days in [1, 7, 14, 30] %}
+        {% for days in [1, 7, 30, 90, 365] %}
         <label class="cursor-pointer">
           <input type="radio" name="days" value="{{ days }}" class="peer sr-only" {% if days == 7 %}checked{% endif %}>
           <span class="block text-center rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-300 peer-checked:border-brand peer-checked:text-white peer-checked:bg-teal-950">
@@ -175,11 +177,11 @@
 
       <div class="flex items-center justify-between gap-3">
         <div id="history-import-feedback" class="text-xs text-slate-400">
-          Safe to run more than once; existing timestamps are skipped.
+          Safe to run more than once; nothing already recorded is duplicated.
         </div>
         <button type="submit"
                 class="bg-brand hover:bg-teal-400 text-white rounded-lg px-4 py-2 text-sm font-semibold">
-          Import
+          Repair &amp; import
         </button>
       </div>
     </form>

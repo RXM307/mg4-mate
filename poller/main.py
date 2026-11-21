@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import threading
 import time
 
 from db import Database
@@ -45,6 +46,40 @@ def load_ha_config(db: "Database") -> dict:
     }
 
 
+def run_background_repairs(db_path: str, cfg: dict, vehicle_id: int) -> None:
+    """One-time and cheap repairs of data recorded before the entity names matched.
+
+    Rebuilds SOC/odometer/charges from Home Assistant's history and long-term statistics.
+    Uses its own database connection and writes in short transactions.
+    """
+    started = time.time()
+    rdb = None
+    try:
+        rdb = Database(db_path)
+        have_ha = bool(cfg["ha_url"] and cfg["token"])
+        if have_ha:
+            from ha_history import HistoryImporter, HomeAssistantHistoryClient, backfill_ghost_trip_times
+            client = HomeAssistantHistoryClient(cfg["ha_url"], cfg["token"], cfg["entity_prefix"])
+            if not rdb.get_setting("history_repair_v5"):
+                res = HistoryImporter(rdb, vehicle_id, cfg["entity_prefix"]).repair_days(
+                    client, int(os.environ.get("HISTORY_REPAIR_DAYS", "120") or 120))
+                if res.get("snapshots"):  # only count it as done when HA actually returned history
+                    rdb.set_setting("history_repair_v5", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+                log.info("History repair from Home Assistant: %s", res)
+        # cheap, idempotent: untracked trips without SOC/odometer or real times
+        rdb.backfill_ghost_trips(vehicle_id)
+        if have_ha:
+            n = backfill_ghost_trip_times(rdb, vehicle_id, client)
+            if n:
+                log.info("Set real start/end on %d untracked trips from HA history", n)
+    except Exception as exc:  # never affect polling
+        log.warning("Background repair skipped: %s", exc)
+    finally:
+        if rdb is not None:
+            rdb.close()
+        log.info("Background repairs finished in %.0fs", time.time() - started)
+
+
 def main():
     db_path = os.environ.get("DB_PATH", "mg4_mate.db")
     log.info("Starting MG4 Mate poller")
@@ -78,19 +113,11 @@ def main():
 
     db.mark_setup_complete()
 
-    # Repair untracked trips recorded by older versions (no SOC/odometer, 0 min).
-    try:
-        db.backfill_ghost_trips(vehicle_id)
-        if cfg["ha_url"] and cfg["token"]:
-            from ha_history import HomeAssistantHistoryClient, backfill_ghost_trip_times
-            n = backfill_ghost_trip_times(
-                db, vehicle_id,
-                HomeAssistantHistoryClient(cfg["ha_url"], cfg["token"], cfg["entity_prefix"]),
-            )
-            if n:
-                log.info("Set real start/end on %d untracked trips from HA history", n)
-    except Exception as exc:  # never block polling on a repair step
-        log.warning("Untracked-trip repair skipped: %s", exc)
+    # Repairs of older data run in the background on their own connection, so they can never
+    # delay live polling (they used to run here and held up the first poll for minutes).
+    threading.Thread(
+        target=run_background_repairs, args=(db_path, cfg, vehicle_id), daemon=True, name="history-repair"
+    ).start()
 
     # Crash/restart recovery for open trips/charges happens on the first poll inside
     # Recorder._resume_or_close(), which RESUMES a still-ongoing session (avoiding

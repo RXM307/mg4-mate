@@ -3,7 +3,7 @@ import logging
 import math
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -216,6 +216,14 @@ _MG4_SCHEDULE: list[tuple[str, int | None, int | None, str]] = [
 ]
 
 
+def _iso_shift(iso: str, days: float) -> str:
+    """ISO timestamp shifted by ``days``, normalised to UTC like the stored ``recorded_at`` values."""
+    dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (dt + timedelta(days=days)).astimezone(timezone.utc).isoformat()
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -235,7 +243,7 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 class Database:
     def __init__(self, path: str = "mg4_mate.db"):
         self._path = path
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(SCHEMA)
@@ -526,6 +534,7 @@ class Database:
         duration_min: float,
         efficiency_kwh_100km: Optional[float],
         gps_points: list,
+        regen_kwh: float = 0.0,
     ) -> int:
         cur = self._conn.execute(
             """INSERT INTO trips (vehicle_id, started_at, ended_at, start_lat, start_lon,
@@ -534,7 +543,7 @@ class Database:
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (vehicle_id, started_at, ended_at, start_lat, start_lon, end_lat, end_lon,
              distance_km, start_soc, end_soc, start_odometer_km, end_odometer_km,
-             duration_min, efficiency_kwh_100km, 0.0),
+             duration_min, efficiency_kwh_100km, round(regen_kwh, 3)),
         )
         trip_id = cur.lastrowid
         for pt in gps_points:
@@ -723,63 +732,249 @@ class Database:
         return trip_id
 
     def _ghost_efficiency(self, dist_km, start_soc, end_soc) -> Optional[float]:
-        if not dist_km or dist_km <= 0.5 or start_soc is None or end_soc is None or end_soc >= start_soc:
+        if (not dist_km or dist_km <= 0.5 or start_soc is None or end_soc is None
+                or start_soc <= 0 or end_soc <= 0 or end_soc >= start_soc):
             return None
         energy = (start_soc - end_soc) / 100.0 * self.get_battery_capacity()
         return round(energy / dist_km * 100, 2)
 
-    def backfill_ghost_trips(self, vehicle_id: int) -> int:
-        """Fill odometer/SOC/efficiency on untracked trips from the recorded positions.
+    def backfill_ghost_trips(self, vehicle_id: int, soc_lookup=None) -> int:
+        """Fill odometer/SOC/efficiency on untracked trips.
 
         Ghost trips used to be stored with only a distance. The positions table still has the
-        odometer and SOC from just before and just after each jump, so reconstruct them.
-        Idempotent: only touches untracked trips that still have no start SOC.
+        odometer and SOC from just before and just after each odometer jump, so reconstruct
+        them. Works for merged ghost trips too (their distance is the sum of the merged jumps).
+        SOC <= 0 is a placeholder from before the entities matched, so such trips (and positions)
+        count as missing.
+
+        ``soc_lookup(started_at, ended_at) -> (start_soc, end_soc) | None`` supplies an estimate
+        (e.g. from long-term statistics) for trips whose positions carry no usable SOC; it can
+        also fill SOC for trips whose odometer jump can't be located. Idempotent. Reasons for
+        skipped trips are left in ``self.backfill_stats``.
         """
+        stats = {"candidates": 0, "no_positions": 0, "no_jump": 0, "odometer_mismatch": 0, "no_soc": 0}
+        self.backfill_stats = stats
         trips = self._conn.execute(
-            """SELECT id, ended_at, distance_km FROM trips
-               WHERE vehicle_id=? AND untracked=1 AND start_soc IS NULL AND ended_at IS NOT NULL""",
+            """SELECT id, started_at, ended_at, distance_km FROM trips
+               WHERE vehicle_id=? AND untracked=1 AND ended_at IS NOT NULL
+                 AND (start_soc IS NULL OR start_soc <= 0 OR end_soc IS NULL OR end_soc <= 0)""",
             (vehicle_id,),
         ).fetchall()
+        stats["candidates"] = len(trips)
         fixed = 0
         for t in trips:
-            end = self._conn.execute(
-                """SELECT id, odometer_km FROM positions
-                   WHERE vehicle_id=? AND odometer_km IS NOT NULL
-                     AND ABS(julianday(recorded_at) - julianday(?)) < 0.007
-                   ORDER BY ABS(julianday(recorded_at) - julianday(?)) LIMIT 1""",
-                (vehicle_id, t["ended_at"], t["ended_at"]),
-            ).fetchone()
-            if not end:
+            dist = t["distance_km"] or 0
+            match, reason = self._match_odometer_jump(vehicle_id, t["ended_at"], dist)
+            soc = None            # (start, end, estimated)
+            if match:
+                end, prev = match
+                first_new = self._conn.execute(
+                    """SELECT soc, latitude, longitude FROM positions
+                       WHERE vehicle_id=? AND recorded_at > ? AND odometer_km >= ?
+                       ORDER BY recorded_at LIMIT 1""",
+                    (vehicle_id, prev["recorded_at"], end["odometer_km"] - 0.4),
+                ).fetchone()
+                # SOC <= 0 is a placeholder from before the entities matched, not a reading
+                if (first_new and prev["soc"] is not None and first_new["soc"] is not None
+                        and prev["soc"] > 0 and first_new["soc"] > 0):
+                    soc = (prev["soc"], first_new["soc"], False)
+            if soc is None and soc_lookup is not None:
+                est = soc_lookup(t["started_at"], t["ended_at"])
+                if est:
+                    eff = self._ghost_efficiency(dist, est[0], est[1])
+                    # an hour that also contained a charge (or a second drive) would imply an
+                    # impossible consumption: better no SOC than a wrong one
+                    if eff is None or 4 <= eff <= 50:
+                        soc = (est[0], est[1], True)
+            if not match and soc is None:
+                stats[reason] += 1
                 continue
-            prev = self._conn.execute(
-                """SELECT id, odometer_km, soc, latitude, longitude FROM positions
-                   WHERE vehicle_id=? AND id<=? AND odometer_km < ? ORDER BY id DESC LIMIT 1""",
-                (vehicle_id, end["id"], end["odometer_km"] - 0.4),
-            ).fetchone()
-            if not prev:
+            if match and soc is None:
+                stats["no_soc"] += 1
                 continue
-            if abs((end["odometer_km"] - prev["odometer_km"]) - (t["distance_km"] or 0)) > 0.6:
-                continue  # positions don't line up with this trip; leave it alone
-            first_new = self._conn.execute(
-                """SELECT soc, latitude, longitude FROM positions
-                   WHERE vehicle_id=? AND id>? ORDER BY id LIMIT 1""",
-                (vehicle_id, prev["id"]),
-            ).fetchone()
-            if not first_new or prev["soc"] is None or first_new["soc"] is None:
-                continue
+            if match:
+                self._conn.execute(
+                    """UPDATE trips SET start_odometer_km=?, end_odometer_km=?, start_lat=?, start_lon=?,
+                           end_lat=?, end_lon=? WHERE id=?""",
+                    (prev["odometer_km"], end["odometer_km"], prev["latitude"], prev["longitude"],
+                     first_new["latitude"] if first_new else None, first_new["longitude"] if first_new else None,
+                     t["id"]),
+                )
+            efficiency = self._ghost_efficiency(dist, soc[0], soc[1])
             self._conn.execute(
-                """UPDATE trips SET start_odometer_km=?, end_odometer_km=?, start_soc=?, end_soc=?,
-                       start_lat=?, start_lon=?, end_lat=?, end_lon=?, efficiency_kwh_100km=?
-                   WHERE id=?""",
-                (prev["odometer_km"], end["odometer_km"], prev["soc"], first_new["soc"],
-                 prev["latitude"], prev["longitude"], first_new["latitude"], first_new["longitude"],
-                 self._ghost_efficiency(t["distance_km"], prev["soc"], first_new["soc"]), t["id"]),
+                "UPDATE trips SET start_soc=?, end_soc=?, efficiency_kwh_100km=? WHERE id=?",
+                (soc[0], soc[1], efficiency, t["id"]),
             )
             fixed += 1
         self._conn.commit()
-        if fixed:
-            log.info("Backfilled odometer/SOC on %d untracked trips", fixed)
+        if fixed or stats["candidates"]:
+            log.info("Untracked trips: %d candidates, %d repaired, skipped %s", stats["candidates"], fixed,
+                     {k: v for k, v in stats.items() if k != "candidates" and v})
         return fixed
+
+    def _match_odometer_jump(self, vehicle_id: int, ended_at: str, dist: float):
+        """Find the position pair around the odometer jump that produced an untracked trip.
+
+        Returns ((end_row, prev_row), None) or (None, reason). Uses time order (not row ids,
+        since imported positions fill gaps with later ids) and index-friendly time ranges.
+        """
+        # Jumps shortly around the trip's end. The window reaches forward because a corrected end
+        # time (real power-off) precedes the refresh that first showed the trip.
+        try:
+            lo, hi = _iso_shift(ended_at, -0.007), _iso_shift(ended_at, 0.125)
+        except (TypeError, ValueError):
+            return None, "no_positions"
+        before = self._conn.execute(
+            """SELECT odometer_km FROM positions
+               WHERE vehicle_id=? AND odometer_km > 0 AND recorded_at < ?
+               ORDER BY recorded_at DESC LIMIT 1""",
+            (vehicle_id, lo),
+        ).fetchone()
+        window = self._conn.execute(
+            """SELECT id, recorded_at, odometer_km FROM positions
+               WHERE vehicle_id=? AND odometer_km IS NOT NULL AND odometer_km > 0
+                 AND recorded_at >= ? AND recorded_at <= ?
+               ORDER BY recorded_at""",
+            (vehicle_id, lo, hi),
+        ).fetchall()
+        if not window:
+            return None, "no_positions"
+        jumps, last = [], (before["odometer_km"] if before else None)
+        for r in window:
+            if last is not None and r["odometer_km"] - last >= 0.4:
+                jumps.append(r)
+            last = r["odometer_km"]
+        if not jumps:
+            return None, "no_jump"
+        for end in jumps:
+            prev = self._conn.execute(
+                """SELECT id, recorded_at, odometer_km, soc, latitude, longitude FROM positions
+                   WHERE vehicle_id=? AND recorded_at < ? AND odometer_km IS NOT NULL
+                     AND odometer_km <= ? ORDER BY recorded_at DESC LIMIT 1""",
+                (vehicle_id, end["recorded_at"], end["odometer_km"] - dist + 0.6),
+            ).fetchone()
+            if prev and abs((end["odometer_km"] - prev["odometer_km"]) - dist) <= 0.6:
+                return (end, prev), None
+        return None, "odometer_mismatch"
+
+    def get_trips_needing_regen(self, vehicle_id: int, since_iso: str) -> list:
+        """Recorded (not untracked) trips with no regen figure."""
+        return self._conn.execute(
+            """SELECT id, started_at, ended_at FROM trips
+               WHERE vehicle_id=? AND COALESCE(untracked,0)=0 AND ended_at IS NOT NULL
+                 AND (regen_kwh IS NULL OR regen_kwh = 0) AND started_at >= ?
+               ORDER BY started_at""",
+            (vehicle_id, since_iso),
+        ).fetchall()
+
+    def set_trip_regen(self, trip_id: int, regen_kwh: float) -> None:
+        self._conn.execute("UPDATE trips SET regen_kwh=? WHERE id=?", (round(regen_kwh, 3), trip_id))
+
+    def oldest_missing_soc(self, vehicle_id: int) -> Optional[str]:
+        """Oldest timestamp that still has no usable SOC (positions or untracked trips)."""
+        row = self._conn.execute(
+            """SELECT MIN(t) FROM (
+                   SELECT MIN(recorded_at) AS t FROM positions
+                     WHERE vehicle_id=? AND (soc IS NULL OR soc <= 0)
+                   UNION ALL
+                   SELECT MIN(started_at) FROM trips
+                     WHERE vehicle_id=? AND untracked=1
+                       AND (start_soc IS NULL OR start_soc <= 0 OR end_soc IS NULL OR end_soc <= 0)
+               )""",
+            (vehicle_id, vehicle_id),
+        ).fetchone()
+        return row[0] if row and row[0] else None
+
+    def update_position_soc_range(self, position_id: int, soc: float, range_km: Optional[float]) -> None:
+        self._conn.execute(
+            "UPDATE positions SET soc=?, range_km=COALESCE(?, range_km) WHERE id=?",
+            (soc, range_km, position_id),
+        )
+
+    def commit(self) -> None:
+        self._conn.commit()
+
+    def position_repair_stats(self, vehicle_id: int, since_iso: str) -> dict:
+        row = self._conn.execute(
+            """SELECT COUNT(*) AS total, SUM(recorded_at >= ?) AS in_window,
+                      MIN(recorded_at) AS oldest, MAX(recorded_at) AS newest
+               FROM positions WHERE vehicle_id=? AND (soc IS NULL OR soc <= 0)""",
+            (since_iso, vehicle_id),
+        ).fetchone()
+        return {"total": row["total"] or 0, "in_window": row["in_window"] or 0,
+                "oldest": (row["oldest"] or "")[:10], "newest": (row["newest"] or "")[:10]}
+
+    # ── History repair helpers (used by ha_history.HistoryImporter.repair_days) ──
+
+    def get_positions_needing_repair(self, vehicle_id: int, since_iso: str) -> list:
+        """Positions whose SOC is missing/0 (stored before the entities matched)."""
+        return self._conn.execute(
+            """SELECT id, recorded_at FROM positions
+               WHERE vehicle_id=? AND (soc IS NULL OR soc <= 0) AND recorded_at >= ?
+               ORDER BY recorded_at""",
+            (vehicle_id, since_iso),
+        ).fetchall()
+
+    def repair_position(self, position_id: int, data) -> None:
+        self._conn.execute(
+            """UPDATE positions SET soc=?, range_km=?, odometer_km=?, speed_kmh=?, charging=?,
+                   plug_connected=?, is_locked=?, trunk_open=?, windows_open=?,
+                   door_fl_open=?, door_fr_open=?, door_rl_open=?, door_rr_open=?, bonnet_open=?,
+                   aux_battery_v=?, lights_any=?, tyre_fl_bar=?, tyre_fr_bar=?, tyre_rl_bar=?,
+                   tyre_rr_bar=?, charge_voltage_v=?, charge_current_a=?, remaining_charge_min=?
+               WHERE id=?""",
+            (data.soc, data.range_km, data.odometer_km, data.speed_kmh,
+             1 if data.charging_status else 0, int(bool(data.plug_connected)), int(bool(data.is_locked)),
+             int(bool(data.trunk_open)), int(bool(data.windows_open)),
+             int(bool(data.door_fl_open)), int(bool(data.door_fr_open)),
+             int(bool(data.door_rl_open)), int(bool(data.door_rr_open)), int(bool(data.bonnet_open)),
+             data.aux_battery_v, int(bool(data.lights_dipped or data.lights_main or data.lights_side)),
+             data.tyre_fl_bar, data.tyre_fr_bar, data.tyre_rl_bar, data.tyre_rr_bar,
+             data.charge_voltage_v, data.charge_current_a, data.remaining_charge_min, position_id),
+        )
+
+    def position_times(self, vehicle_id: int, since_iso: str) -> list[float]:
+        """Epoch seconds of every stored position since ``since_iso`` (sorted)."""
+        out = []
+        for (ts,) in self._conn.execute(
+            "SELECT recorded_at FROM positions WHERE vehicle_id=? AND recorded_at >= ? ORDER BY recorded_at",
+            (vehicle_id, since_iso),
+        ):
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            out.append((dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp())
+        out.sort()
+        return out
+
+    def position_near(self, vehicle_id: int, recorded_at: str, seconds: int = 90) -> bool:
+        row = self._conn.execute(
+            """SELECT 1 FROM positions WHERE vehicle_id=?
+               AND ABS(julianday(recorded_at) - julianday(?)) * 86400 <= ? LIMIT 1""",
+            (vehicle_id, recorded_at, seconds),
+        ).fetchone()
+        return row is not None
+
+    def trip_overlaps(self, vehicle_id: int, started_at: str, ended_at: str, margin_s: int = 300) -> bool:
+        m = margin_s / 86400.0
+        row = self._conn.execute(
+            """SELECT 1 FROM trips WHERE vehicle_id=?
+               AND julianday(started_at) <= julianday(?) + ?
+               AND julianday(COALESCE(ended_at, started_at)) >= julianday(?) - ? LIMIT 1""",
+            (vehicle_id, ended_at, m, started_at, m),
+        ).fetchone()
+        return row is not None
+
+    def charge_overlaps(self, vehicle_id: int, started_at: str, ended_at: str, margin_s: int = 1800) -> bool:
+        m = margin_s / 86400.0
+        row = self._conn.execute(
+            """SELECT 1 FROM charges WHERE vehicle_id=?
+               AND julianday(started_at) <= julianday(?) + ?
+               AND julianday(COALESCE(ended_at, started_at)) >= julianday(?) - ? LIMIT 1""",
+            (vehicle_id, ended_at, m, started_at, m),
+        ).fetchone()
+        return row is not None
 
     def get_ghost_trips_without_duration(self, vehicle_id: int) -> list:
         return self._conn.execute(
